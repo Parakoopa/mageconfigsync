@@ -2,94 +2,179 @@
 
 namespace MageConfigSync\Command;
 
-use MageConfigSync\ConfigYaml;
-use MageConfigSync\Factory\ConfigurationAdapterFactory;
-use MageConfigSync\Magento;
-use MageConfigSync\Magento\ConfigurationAdapter;
-use Symfony\Component\Console\Command\Command;
+use Aura\Sql\ExtendedPdo;
+use DI\Container;
+use MageConfigSync\Config\Environment;
+use MageConfigSync\ConfigReader\ConfigReader;
+use MageConfigSync\Framework\Magento;
+use MageConfigSync\Parser\YamlParser;
+use MageConfigSync\Util\ArrayUtil;
+use Meanbee\LibMageConf\RootDiscovery;
+use Psr\Container\ContainerInterface;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
-use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
-use Symfony\Component\Yaml\Parser;
+use Symfony\Component\Yaml\Exception\ParseException;
 
-class LoadCommand extends Command
+class LoadCommand extends BaseCommand
 {
+    const ARG_FILE_NAME = 'config-yaml-file';
+    /**
+     * @inheritdoc
+     */
+    const NAME = 'load';
+    
+    /**
+     * @inheritdoc
+     */
+    const DESCRIPTION = 'Import configuration from a file into Magento.';
+
+    /**
+     * @var YamlParser
+     */
+    protected $yamlParser;
+    
+    /**
+     * @var ConfigReader
+     */
+    protected $configReader;
+    
+    public function __construct(Container $container, YamlParser $yamlParser, ConfigReader $configReader)
+    {
+        parent::__construct($container);
+        
+        $this->yamlParser = $yamlParser;
+        $this->configReader = $configReader;
+    }
+    
+    /**
+     * @inheritdoc
+     */
     protected function configure()
     {
+        parent::configure();
+        
         $this
-            ->setName('load')
-            ->setDescription('Import configuration from a file into Magento.')
             ->addArgument(
-                'config-yaml-file',
+                self::ARG_FILE_NAME,
                 InputArgument::REQUIRED,
                 'The YAML file containing the configuration settings.'
-            )
-            ->addOption(
-                'magento-root',
-                null,
-                InputArgument::OPTIONAL,
-                'The Magento root directory, defaults to current working directory.',
-                getcwd()
-            )
-            ->addOption(
-                'env',
-                null,
-                InputArgument::OPTIONAL,
-                'Environment to import.  If one is not provided, no environment will be used.'
             );
     }
-
+    
+    /**
+     * @param InputInterface  $input
+     * @param OutputInterface $output
+     * @return int
+     * @throws \Symfony\Component\Console\Exception\InvalidArgumentException
+     * @throws \DI\NotFoundException
+     * @throws \DI\DependencyException
+     * @throws \InvalidArgumentException
+     */
     protected function execute(InputInterface $input, OutputInterface $output)
     {
-        /** @var \Symfony\Component\Console\Output\ConsoleOutput $output */
+        parent::execute($input, $output);
+        
+        $fileName     = $input->getArgument(self::ARG_FILE_NAME);
+        $requestedEnv = $input->getOption(self::OPTION_ENV) ?: null;
+        
+        $parser       = $this->yamlParser;
+        $configReader = $this->configReader;
 
-        $config_adapter = ConfigurationAdapterFactory::create($input->getOption('magento-root'));
-
-        $yaml = new Parser();
-
-        if ($input->getArgument('config-yaml-file')) {
-            $config_yaml_file = $input->getArgument('config-yaml-file');
-
-            if (!file_exists($config_yaml_file)) {
-                throw new \Exception("File ($config_yaml_file) does not exist");
-            }
-
-            if (!is_readable($config_yaml_file)) {
-                throw new \Exception("File ($config_yaml_file) is not readable");
-            }
-
-            $config_file_contents = $yaml->parse(file_get_contents($config_yaml_file));
-            $config_file_yaml = new ConfigYaml($config_file_contents, $input->getOption('env'));
-
-            foreach ($config_file_yaml->getData() as $scope_key => $scope_data) {
-                foreach ($scope_data as $path => $value) {
-                    $scope_data = ConfigYaml::extractFromScopeKey($scope_key);
-
-                    if ($value !== null) {
-                        $affected_rows = $config_adapter->setValue($path, $value, $scope_data['scope'], $scope_data['scope_id']);
-                    } else {
-                        $affected_rows = $config_adapter->deleteValue($path, $scope_data['scope'], $scope_data['scope_id']);
-                    }
-
-                    if ($affected_rows > 0) {
-                        $line = sprintf(
-                            "[%s] %s -> %s",
-                            $scope_key,
-                            $path,
-                            $value ?: 'null'
-                        );
-
-                        if (method_exists($output, 'getErrorOutput')) {
-                            $output->getErrorOutput()->writeln($line);
-                        } else {
-                            $output->writeln($line);
-                        }
-                    }
-                }
-            }
+        try {
+            $parsedFile = $parser->parse($fileName);
+        } catch (\Exception $e) {
+            $this->error('Error experienced parsing YAML file: '. $e->getMessage());
+            return ExitCode::GENERIC_ERROR;
         }
 
-        return 0;
+        $fileEnvironments = $configReader->generate($parsedFile);
+        
+        if (null === $requestedEnv && count($fileEnvironments) > 1) {
+            $this->error('File contains multiple environments but no environment specified.');
+            return ExitCode::GENERIC_ERROR;
+        }
+        
+        if (null !== $requestedEnv) {
+            $environment = ArrayUtil::findValueByCallback($fileEnvironments, function ($item) use ($requestedEnv) {
+                /** @var Environment $item */
+                return $item->getName() === $requestedEnv;
+            });
+            
+            if (!$environment) {
+                $this->error(sprintf(
+                    "Requested environment '%s' was not found in the file.",
+                    $requestedEnv
+                ));
+                
+                return ExitCode::GENERIC_ERROR;
+            }
+        } else {
+            $environment = $fileEnvironments[0];
+        }
+        
+        /**
+         * @var $rootDiscover RootDiscovery
+         */
+        $rootDiscover = $this->container->make(RootDiscovery::class, [
+            $input->hasOption(self::OPTION_MAGE_ROOT) ? $input->getOption(self::OPTION_MAGE_ROOT) : getcwd()
+        ]);
+        
+        $configReader = $rootDiscover->getConfigReader();
+        
+        $pdo = new ExtendedPdo(
+            sprintf(
+                'mysql:dbname=%s;host=%s;port=%s',
+                $configReader->getDatabaseName(),
+                $configReader->getDatabaseHost(),
+                $configReader->getDatabasePort()
+            ),
+            $configReader->getDatabaseUsername(),
+            $configReader->getDatabasePassword()
+        );
+        
+        $magento = new Magento($pdo);
+        
+        $configItemSet  = $environment->getConfigItemSet();
+        $processedItems = $magento->processConfigItemSet($configItemSet);
+        
+        $processedConfigCount = count($processedItems);
+        
+        foreach ($processedItems as $item) {
+            if ($item->isDelete()) {
+                $output->writeln(sprintf(
+                    '<info>%s: %s -> (deleted)</info>',
+                    $item->getScope(),
+                    $item->getKey()
+                ));
+            } else {
+                $output->writeln(sprintf(
+                    '<info>%s: %s -> %s</info>',
+                    $item->getScope(),
+                    $item->getKey(),
+                    $item->getValue()
+                ));
+            }
+        }
+        
+        $countRequestedChanges = count($configItemSet);
+        $countChangesMade = count($processedConfigCount);
+        
+        if ($countRequestedChanges !== $countChangesMade) {
+            $output->writeln(sprintf(
+                'Found %d config%s to apply but only %d needed to be applied.',
+                $countRequestedChanges,
+                ($countChangesMade == 1) ? '' : 's',
+                $countChangesMade
+            ));
+        } else {
+            $output->writeln(sprintf(
+                'Found %d config%s to apply, all of which were applied successfully.',
+                $countRequestedChanges,
+                ($countChangesMade == 1) ? '' : 's'
+            ));
+        }
+        
+        return ExitCode::SUCCESS;
     }
 }

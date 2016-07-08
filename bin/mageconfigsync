@@ -12,9 +12,17 @@ foreach ($autoload_files as $autoload_file) {
     } 
 }
 
-if (!class_exists("Composer\Autoload\ClassLoader")) {
+if (!class_exists(Composer\Autoload\ClassLoader::class)) {
     trigger_error("Dependencies have not been installed.  Have you run 'composer install'?", E_USER_ERROR);
 }
 
-$application = new MageConfigSync\Application();
+$containerBuilder = new \DI\ContainerBuilder();
+
+$containerBuilder->addDefinitions([
+    \Psr\Log\LoggerInterface::class => new \Monolog\Logger('mageconfigsync')
+]);
+
+$container = $containerBuilder->build();
+
+$application = new MageConfigSync\Application($container);
 $application->run();

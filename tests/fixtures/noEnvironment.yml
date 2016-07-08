@@ -1,0 +1,3 @@
+default:
+  currency/options/base: GBP
+  dev/restrict/allow_ips: null

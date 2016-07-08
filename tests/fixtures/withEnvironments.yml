@@ -1,0 +1,9 @@
+production:
+    default:
+        dev/debug/template_hints: 0
+development:
+    default:
+        dev/debug/template_hints: 1
+    stores-1:
+        currency/options/base: GBP
+        dev/restrict/allow_ips: null
