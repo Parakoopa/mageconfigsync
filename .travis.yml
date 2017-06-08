@@ -4,6 +4,8 @@ php:
   - 5.4
   - 5.5
   - 5.6
+  - 7.0
+  - 7.1
   - hhvm
 env:
   - MAGENTO_VERSION=1.7.0.2
@@ -11,7 +13,8 @@ env:
   - MAGENTO_VERSION=1.9.2.4
 matrix:
   allow_failures:
-    - php: 5.6
+    - php: 7.0
+    - php: 7.1
     - php: hhvm
 before_script:
   - mysql -uroot -e "CREATE USER 'mageconfigsync'@'localhost' IDENTIFIED BY 'mageconfigsync';"
